@@ -1,0 +1,270 @@
+---
+title: 'IS607 - Project 5: Managing the Logistics of Physical Natural Gas Operations
+  in Neo4j'
+author: "Derek G. Nokes"
+date: "Sunday, May 10, 2015"
+output: pdf_document
+toc: yes
+---
+
+\pagebreak
+
+# Business Use Case
+
+The logistics associated with the trading of physical natural gas are complex. In simple terms, pipelines move gas from areas of excess supply to areas of excess demand. Locations where many pipelines connect are referred to as 'hubs'. Physical natural gas is priced at all hubs. These prices represent the cost of moving gas through the network of pipelines, hubs, and storage facilities.
+
+When demand exceeds supply in a particular location, prices rise in relation to other locations and gas tends to be re-routed to high-demand points. Physical constraints that prevent gas from flowing to a particular location create price spikes. Conversely, in areas of excess supply, prices tend to fall.
+
+Gas can typically only flow in one direction along a pipeline. The physical characteristics of the pipelines determine flow capacity. Maintainence along pipelines - for instance - creates capacity constraints that temporarily prevent gas from freely following over particular paths. Such constraints can create incredible volatility in gas prices.
+
+Contracting to buy gas at one location and sell that gas at another location for more than the transportation and other costs results in profits. To run a profitable natural gas trading business, one must be able to understand the natural gas network.  
+
+Graphs provide a very natural abstract representation for the network of physical natural gas hubs connected by pipelines. 
+
+In the diagram below we represent 6 hubs connected by pipelines. The direction of gas flow is represented by an arrow.
+
+```{r,echo=FALSE}
+library(igraph)
+dg<-graph.formula(hub1 -+ hub2,hub2 -+ hub3,hub3 -+ hub1,hub4 -+ hub1,hub5 -+ hub4, hub6 -+ hub5,hub4 -+ hub6, hub1 -+ hub5,hub4-+hub3)
+plot(dg)
+```
+
+# Nodes, Relationships, and Attributes
+
+Each hub is connected to at least one pipeline. The cost of trasporting gas from one hub to another is roughly the price spread between the quoted prices at the two hubs. 
+
+## Nodes
+We define each hub as a node in our graph.
+
+## Relationships
+
+Pipelines - which allow physical gas to flow from one hub to another - connect nodes. 
+
+## Attributes/Properties
+
+Each path from one hub to another has a particular associated transportation cost. We can imply these costs from traded prices at each hub. We define the difference in price between any two given nodes as the implied cheapest cost of transporting gas between the two hubs.
+
+Pipelines typically flow in only one direction. The direction of flow is a property of the path between two hubs. 
+
+# Data
+
+## Raw Data
+
+Natural Gas Intelligence (NGI), is one of the leading publishers of pricing data for physical natural gas. NGI also redistributes trade data associated with the ICE exchange.
+
+We extract the most recent ICE day-ahead natural gas price report from the Natural Gas Intelligence (NGI) service website using the 'rvest' package:
+
+```{r}
+# load the rvest package
+library(rvest)
+# set the NGI URL
+urlString<-'http://www.naturalgasintel.com/ext/resources/Daily-GPI/ICE.htm'
+# open the session
+htmlSession <- html(urlString)
+# define output directory
+outputDirectory<-'C:/Users/DerekG/Documents/R/IS607/Project_5/'
+# define output file name
+outputFileNameCSV<-'dayAheadNatGasICE'
+# define the .csv output file name
+outputFileNameCsvFull<-paste0(outputDirectory,outputFileNameCSV,'.csv')
+# define the .RData output file name
+outputFileNameRFull<-paste0(outputDirectory,outputFileNameCSV,'.RData')
+# fetch the ICE day-ahead natural gas price report data
+table <- htmlSession %>% html() %>% html_nodes("table") %>% html_table()
+a<-table[[1]]
+# extract the trade and flow dates
+tradeAndFlowDates<-a$X1[1]
+# make the header
+header<-c(a$X1[2],a$X2[2],a$X3[2],a$X4[2],a$X5[2],a$X6[2],a$X7[2])
+# extract the columns
+hub<-a$X1[3:length(a$X1)]
+highPrice<-as.numeric(sub('[$]','',a$X2[3:length(a$X2)],perl=TRUE))
+lowPrice<-as.numeric(sub('[$]','',a$X3[3:length(a$X3)]))
+avgPrice<-as.numeric(sub('[$]','',a$X4[3:length(a$X4)]))
+chg<-as.numeric(a$X5[3:length(a$X5)])
+volume<-as.numeric(sub('[,]','',a$X6[3:length(a$X6)]))
+numberOfTrades<-as.numeric(sub('[,]','',a$X7[3:length(a$X7)]))
+# bind the columns together
+rawData<-cbind(highPrice,lowPrice,avgPrice,chg,volume,numberOfTrades)
+# create data frame
+data<-data.frame(hub,rawData)
+# write data to .csv file for upload to Neo4j
+write.csv(data,file=outputFileNameCsvFull,row.names=FALSE)
+# write data to .RData file for quick use in R
+save(list=c('data'),file=outputFileNameRFull)
+# add a header for data table
+colnames(data)<-header
+```
+
+The following table displays pricing information on physical fixed-price trades on ICE for Next Day physical gas for the first 10 of the `r nrow(data)` reported hubs:
+
+```{r}
+# create a table with sample data
+knitr::kable(head(data,10),caption='Sample ICE day-ahead natural gas prices')
+```
+
+We use on the average price at each hub to determine the implied cost of transporting gas between hubs below.
+
+## Preprocessing
+
+First, we can determine each unique two-hub spread and compute the implied costs of transporting gas between any two hubs by taking the simple difference between the prices at the hubs:
+
+```{r}
+# create structure to store nat gas spreads
+natGasSpreads<-{}
+
+for (hub1Index in seq_along(hub)){
+  # extract the name of hub 1
+  hub1<-hub[hub1Index]
+  # extract the average price of hub 2
+  hub1Price<-avgPrice[hub1Index]
+  
+  for (hub2Index in seq_along(hub)){
+    
+    if (hub1Index != hub2Index){
+      # extract the name of hub 2    
+      hub2<-hub[hub2Index]
+      # extract the average price for hub 2
+      hub2Price<-avgPrice[hub2Index]
+      spread<-hub1Price-hub2Price
+      ratio<-hub1Price/hub2Price
+      # store the hubs, prices, and spread
+      natGasSpreads<-rbind(natGasSpreads,c(hub1,hub2,
+        hub1Price,hub2Price,spread,ratio))
+    }
+  }
+}
+# create the spread data
+spreadData<-data.frame(natGasSpreads)
+# name the columns
+colnames(spreadData)<-c('hub1','hub2','priceAtHub1','priceAtHub2','spread','ratio')
+# count the number of spreads
+nSpreads<-nrow(spreadData)
+# define output file name
+outputFileNameCSV<-'dayAheadNatGasICESpreads'
+# define the .csv output file name
+outputFileNameCsvFull<-paste0(outputDirectory,outputFileNameCSV,'.csv')
+# write the .csv file
+write.csv(spreadData,file=outputFileNameCsvFull,row.names=FALSE)
+
+```
+
+There are `r nSpreads` distinct natural gas spreads if we constrain the spread to the difference between just two nodes. 
+
+Next, we extract a subset of the spreads. The following table shows all of the hubs spread against the 'Henry' hub:
+
+```{r}
+# find all of the spreads to the benchmark 'Henry' hub 
+henryIndex<-spreadData[,1]=='Henry'
+# create a table with the spreads to the benchmark 'Henry' hub
+knitr::kable(head(spreadData[henryIndex,],10),
+  caption='Sample ICE day-ahead natural gas price spreads')
+```
+
+```{r,echo=FALSE}
+# define output file name
+outputFileNameCSV<-'dayAheadNatGasICEHenryHubSpreads'
+# define the .csv output file name
+outputFileNameCsvFull<-paste0(outputDirectory,outputFileNameCSV,'.csv')
+# extract the implied cost for moving gas from Henry hub to any other hub
+impliedCost<-spreadData[henryIndex,]
+# write the .csv file
+write.csv(impliedCost,file=outputFileNameCsvFull,row.names=FALSE)
+```
+
+# Queries to Acquire and Manage Data
+
+Iterate over the hubs create the nodes and relationships using the R package, RNeo4j.
+
+```{r}
+# load the package
+library(RNeo4j)
+# set the connection parameters
+graphURL<-'http://localhost:7474/db/data/'
+userName<-'neo4j'
+password<-'tgdnrx78'
+# connect to the database 
+graph = startGraph(graphURL,username = userName,password = password)
+# clear the database
+clear(graph,input=FALSE)
+# find the henry hub
+henryIndex<-hub=="Henry"
+# extract the name of hub 1
+hub1<-hub[henryIndex]
+# extract the average price of hub 2
+hub1Price<-avgPrice[henryIndex]
+# define the node for hub 1
+hub1<-createNode(graph,'hub',hub=hub1,priceAtHub=hub1Price)
+  
+for (hub2Index in seq_along(hub)){
+    
+  if (hub1Index != hub2Index){
+    # extract the name of hub 2    
+    hub2<-hub[hub2Index]
+    # extract the average price for hub 2
+    hub2Price<-avgPrice[hub2Index]
+    spread<-hub1Price-hub2Price
+    ratio<-hub1Price/hub2Price
+    # define the node for hub 2
+    hub2<-createNode(graph,'hub',hub=hub2,priceAtHub=hub2Price)
+    # define the relationship with properties
+    createRel(hub1, "COST", hub2, cost = spread)
+  }
+}
+```
+
+The graph database can be visualized as follows:
+
+![Spread over Henry](C:/Users/DerekG/Documents/R/IS607/Project_5/spreadsToBenchmark.png)
+
+# Queries to Access and Analyze Data
+
+Query for the prices at the Waha and the TGT-SL hubs:
+
+```{r}
+# query for the prices at the Waha and TGT-SL hubs
+priceAtWahaTGT<-cypher(graph,"MATCH n WHERE n.hub IN {hubs} RETURN n.hub, n.priceAtHub",
+       hubs = c('Waha','TGT-SL'))
+knitr::kable(priceAtWahaTGT,
+             caption='Prices at Waha and TGT-SL Hubs')
+```
+
+Find the number of cost links between hubs (i.e., pipeline connections)
+
+```{r}
+# query for the number of cost links between hubs
+nSpreads<-cypher(graph,"match (n)-[:COST]-(m) RETURN n.hub, COUNT(m) as nSpreads")
+# create a table with the number links between hubs
+knitr::kable(nSpreads,
+  caption='Number of Links Between Hubs')
+
+```
+
+Query for the 10 most negative spreads:
+
+```{r}
+# query for the 10 most negative spreads
+worst5NegativeSpreads<-cypher(graph,
+  "match (n)-[:COST]-(m) WHERE n.hub <> 'Henry' AND n.priceAtHub<m.priceAtHub RETURN n.hub,m.hub,(n.priceAtHub-m.priceAtHub) as spread ORDER BY spread LIMIT 10")
+# rename the columns
+colnames(worst5NegativeSpreads)<-c('hub 1','hub 2','spread')
+# create a table with the 5 most negative spreads
+knitr::kable(worst5NegativeSpreads,
+             caption='Excess Supply')
+```
+
+Query for the 10 most positive spreads:
+
+```{r}
+# query for the 10 most positive spreads
+best5PositiveSpreads<-cypher(graph,
+  "match (n)-[:COST]-(m) WHERE n.hub <> 'Henry' AND n.priceAtHub>m.priceAtHub RETURN n.hub,m.hub,(n.priceAtHub-m.priceAtHub) as spread ORDER BY spread DESC LIMIT 10")
+colnames(best5PositiveSpreads)<-c('hub 1','hub 2','spread')
+# create a table with the 5 most positive spreads
+knitr::kable(best5PositiveSpreads,
+             caption='Excess Demand')
+```
+
+# Conclusion
+
+The graph database provides a very powerful approach to understanding the natural gas network.
